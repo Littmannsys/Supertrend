@@ -82,14 +82,15 @@ const MAX_HISTORICAL_CANDLES = 5000;
 //   2. The 5-candle cooldown inside checkEMATouches controls when the next
 //      legitimate cross notification is allowed.
 const recentMessages = {};
-const DEDUP_WINDOW_MS = 5000; // 5 seconds
+const DEDUP_WINDOW_MS = 30000; // 30 seconds
 
 async function sendTelegramNotification(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
   const now = Date.now();
 
-  // Block if this exact message was already sent within the last 5 seconds
+  // Block if this exact message was already sent within the dedup window.
+  // Key is the full message text — identical content from any code path is blocked.
   if (recentMessages[message] && now - recentMessages[message] < DEDUP_WINDOW_MS) {
     console.log('Duplicate notification blocked:', message.substring(0, 60));
     return;
@@ -306,9 +307,10 @@ function processCandles(symbol, timeframe, candles) {
   const lastCandle = data[data.length - 1];
   currentCandles[symbol][timeframe] = { ...lastCandle };
 
-  // Reset price side tracking so no false cross fires on first live tick
-  emaPriceSide[symbol][20] = null;
-  emaPriceSide[symbol][50] = null;
+  // emaPriceSide is initialised to null at declaration and set to 'above'/'below'
+  // on the first live tick. We must NOT reset it here: if historical candles are
+  // re-fetched after a reconnect the side is already tracking correctly, and
+  // clearing it would cause a false cross notification on the very next tick.
 
   // Seed EMA state from all historical CLOSED candles (one-time at startup)
   emaState[symbol][20] = initEMA(historicalData[symbol][timeframe], 20);
