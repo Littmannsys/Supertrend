@@ -14,6 +14,21 @@ const API_URL = 'wss://ws.derivws.com/websockets/v3?app_id=1089';
 let ws;
 let isConnecting = false; // guard against multiple simultaneous connection attempts
 
+// ─── SIGTERM / Duplicate-Instance Guard ──────────────────────────────────────
+// Railway keeps the OLD deploy alive while the NEW one boots (~10-30 s overlap).
+// Both processes share the same Telegram credentials but have separate memory,
+// so recentMessages cannot deduplicate across them.
+// Fix: honour SIGTERM (sent by Railway to the old instance on new deploy) by
+// immediately stopping all outgoing notifications. The new instance is already
+// running and will take over cleanly.
+let allowNotifications = true;
+process.on('SIGTERM', () => {
+  allowNotifications = false;
+  console.log('SIGTERM — notifications stopped, shutting down in 3 s.');
+  if (ws) ws.close();
+  setTimeout(() => process.exit(0), 3000);
+});
+
 // ─── In-memory state (replaces DOM) ──────────────────────────────────────────
 const indicatorState = {
   R_10:   { ema20: null, ema50: null, price: null, lastUpdate: null },
@@ -95,6 +110,8 @@ const DEDUP_WINDOW_MS = 30000; // 30 seconds
 
 async function sendTelegramNotification(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  // Stop sending if this process is being replaced by a new deploy
+  if (!allowNotifications) return;
 
   const now = Date.now();
 
