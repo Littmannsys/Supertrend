@@ -58,6 +58,15 @@ const emaState = {
   stpRNG: { 20: null, 50: null }
 };
 
+// Tracks whether historical candles have been fully loaded for each symbol.
+// Cross notifications are suppressed until this is true, preventing false
+// crosses that fire on the first few live ticks before EMA state is seeded.
+const symbolReady = {
+  R_10:   false,
+  R_25:   false,
+  stpRNG: false
+};
+
 const ema50DistanceNotifState = {
   R_10:   { lastNotifCandle: null },
   R_25:   { lastNotifCandle: null },
@@ -175,6 +184,17 @@ function updateEMAValue(symbol, period, value, currentPrice) {
 // and sends exactly ONE combined Telegram message. After a notification, 5
 // candles must close before the next one is allowed for that EMA period.
 function checkEMATouches(symbol, timeframe, currentPrice, ema20, ema50) {
+  // Still loading historical candles — track price side but never notify.
+  // This prevents false crosses that fire before EMA state is fully seeded.
+  if (!symbolReady[symbol]) {
+    [20, 50].forEach(period => {
+      const ema = period === 20 ? ema20 : ema50;
+      if (ema === null) return;
+      emaPriceSide[symbol][period] = currentPrice >= ema ? 'above' : 'below';
+    });
+    return;
+  }
+
   const symbolName    = displayNames[symbol];
   const timeframeName = displayNames[timeframe];
   const currentCount  = candleCount[symbol][timeframe];
@@ -321,6 +341,9 @@ function processCandles(symbol, timeframe, candles) {
   updateEMAValue(symbol, 20, getLiveEMA(symbol, 20, currentPrice), currentPrice);
   updateEMAValue(symbol, 50, getLiveEMA(symbol, 50, currentPrice), currentPrice);
 
+  // Mark this symbol as ready — live ticks can now fire cross notifications
+  symbolReady[symbol] = true;
+
   console.log(`[${symbol}] Candles loaded: ${data.length} | EMA20: ${emaState[symbol][20]?.toFixed(4)} | EMA50: ${emaState[symbol][50]?.toFixed(4)}`);
 }
 
@@ -406,6 +429,9 @@ function initializeWebSocket() {
 
   ws.on('close', () => {
     isConnecting = false;
+    // Re-arm the ready gate so live ticks after reconnect don't fire
+    // cross notifications before historical candles are re-loaded.
+    Object.keys(symbolReady).forEach(sym => { symbolReady[sym] = false; });
     console.log('Disconnected — reconnecting in 5s...');
     setTimeout(initializeWebSocket, 5000);
   });
