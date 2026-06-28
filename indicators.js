@@ -75,6 +75,10 @@ SYMBOLS.forEach(sym => {
 // Dedup keyed on symbol:timeframe:period — stable across ticks
 const alertSentAt = new Map();
 
+// Dedup processed ticks — key: `${symbol}:${epoch}` prevents same tick firing twice
+// (can happen on reconnect when old + new socket both deliver the same message)
+const processedTicks = new Map();
+
 async function sendTelegramNotification(message, dedupKey) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn('[Telegram] Credentials not configured');
@@ -394,6 +398,14 @@ function handleMessage(raw) {
     const symbol    = data.tick.symbol;
     const price     = parseFloat(data.tick.quote);
     const timestamp = data.tick.epoch;
+
+    // Drop duplicate ticks (same symbol + epoch) — happens on reconnect
+    const tickKey = `${symbol}:${timestamp}`;
+    if (processedTicks.has(tickKey)) return;
+    processedTicks.set(tickKey, Date.now());
+    // Prune old entries (keep last 60 seconds)
+    const cutoff = Date.now() - 60_000;
+    processedTicks.forEach((t, k) => { if (t < cutoff) processedTicks.delete(k); });
 
     updateCurrentCandle(symbol, price, timestamp);
 
