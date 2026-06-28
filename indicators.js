@@ -84,28 +84,28 @@ SYMBOLS.forEach(sym => {
 
 // ─── Telegram ─────────────────────────────────────────────────────────────────
 
-/** Deduplication map: message → timestamp of last send */
-const recentlySent = new Map();
+/**
+ * Deduplication keyed on symbol+period (NOT the message string).
+ * Prevents double-fires caused by the price changing between ticks
+ * while still on the same cross event.
+ * key: `${symbol}:${period}` → timestamp of last send
+ */
+const alertSentAt = new Map();
 
-async function sendTelegramNotification(message) {
+async function sendTelegramNotification(message, dedupKey) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn('[Telegram] Credentials not configured');
     return;
   }
 
-  // Drop exact duplicates sent within 10 seconds
+  // Block if the same symbol+period already alerted within 10 seconds
   const now      = Date.now();
-  const lastSent = recentlySent.get(message) || 0;
+  const lastSent = alertSentAt.get(dedupKey) || 0;
   if (now - lastSent < 10_000) {
-    console.warn('[Telegram] Duplicate blocked:', message);
+    console.warn(`[Telegram] Duplicate blocked for key: ${dedupKey}`);
     return;
   }
-  recentlySent.set(message, now);
-
-  // Prune stale entries
-  recentlySent.forEach((time, key) => {
-    if (now - time > 60_000) recentlySent.delete(key);
-  });
+  alertSentAt.set(dedupKey, now);
 
   const url  = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = JSON.stringify({
@@ -214,7 +214,8 @@ function checkEMATouches(symbol, timeframe, currentPrice, ema20, ema50) {
       `${emoji} *${period} EMA ${symbolName} on ${timeframeName}* : price Touch\n` +
       ` EMA: ${ema.toFixed(4)} | Price: ${currentPrice.toFixed(4)}`;
 
-    sendTelegramNotification(message);
+    const dedupKey = `${symbol}:${period}`;
+    sendTelegramNotification(message, dedupKey);
     console.log(`[Alert] ${message.replace(/\*/g, '')}`);
 
     state.lastNotifCandle = currentCount;
