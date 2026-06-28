@@ -2,8 +2,6 @@
 
 /**
  * Deriv EMA Indicator — Node.js (server-side)
- *
- * Converted from browser HTML/JS. All DOM manipulation removed.
  * Requires: ws  →  npm install ws
  * Usage:    node indicators.js
  */
@@ -23,7 +21,7 @@ const SYMBOLS    = ['R_10', 'R_25', 'stpRNG'];
 const TIMEFRAMES = ['5min'];
 
 const timeframeMap = {
-  '5min': 300   // seconds
+  '5min': 300
 };
 
 const displayNames = {
@@ -33,34 +31,17 @@ const displayNames = {
   '5min':   '5 minutes'
 };
 
-// Maximum historical candles (gives EMA enough warm-up to converge)
 const MAX_HISTORICAL_CANDLES = 5000;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-/** Closed historical candles per symbol/timeframe */
-const historicalData = {};
+const historicalData       = {};  // historicalData[sym][tf]       → candle[]
+const currentCandles       = {};  // currentCandles[sym][tf]       → candle
+const candleCount          = {};  // candleCount[sym][tf]          → number
+const emaNotificationState = {};  // emaNotificationState[sym][tf][period] → {lastNotifCandle, notifSent}
+const emaPriceSide         = {};  // emaPriceSide[sym][tf][period] → 'above'|'below'|null
+const emaState             = {};  // emaState[sym][period]         → number (last CLOSED bar EMA)
 
-/** Current (forming) candle per symbol/timeframe */
-const currentCandles = {};
-
-/** How many candles have closed since startup, per symbol/timeframe */
-const candleCount = {};
-
-/**
- * Notification lock state per symbol + EMA period.
- * lastNotifCandle: candleCount value when the last alert was sent
- * notifSent:       true while within the 5-candle cooldown window
- */
-const emaNotificationState = {};
-
-/** Which side of each EMA the price was on at the last tick */
-const emaPriceSide = {};
-
-/** EMA value at the close of the last COMPLETED bar (seed for live EMA) */
-const emaState = {};
-
-// Initialise state objects for every symbol
 SYMBOLS.forEach(sym => {
   historicalData[sym]       = {};
   currentCandles[sym]       = {};
@@ -73,23 +54,25 @@ SYMBOLS.forEach(sym => {
     historicalData[sym][tf] = [];
     currentCandles[sym][tf] = null;
     candleCount[sym][tf]    = 0;
+
+    // FIX Bug 2 & 3 — scope notification state AND price side per timeframe
+    emaNotificationState[sym][tf] = {};
+    emaPriceSide[sym][tf]         = {};
+
+    [20, 50].forEach(period => {
+      emaNotificationState[sym][tf][period] = { lastNotifCandle: null, notifSent: false };
+      emaPriceSide[sym][tf][period]         = null;
+    });
   });
 
   [20, 50].forEach(period => {
-    emaNotificationState[sym][period] = { lastNotifCandle: null, notifSent: false };
-    emaPriceSide[sym][period]         = null;
-    emaState[sym][period]             = null;
+    emaState[sym][period] = null;
   });
 });
 
 // ─── Telegram ─────────────────────────────────────────────────────────────────
 
-/**
- * Deduplication keyed on symbol+period (NOT the message string).
- * Prevents double-fires caused by the price changing between ticks
- * while still on the same cross event.
- * key: `${symbol}:${period}` → timestamp of last send
- */
+// Dedup keyed on symbol:timeframe:period — stable across ticks
 const alertSentAt = new Map();
 
 async function sendTelegramNotification(message, dedupKey) {
@@ -98,11 +81,10 @@ async function sendTelegramNotification(message, dedupKey) {
     return;
   }
 
-  // Block if the same symbol+period already alerted within 10 seconds
   const now      = Date.now();
   const lastSent = alertSentAt.get(dedupKey) || 0;
   if (now - lastSent < 10_000) {
-    console.warn(`[Telegram] Duplicate blocked for key: ${dedupKey}`);
+    console.warn(`[Telegram] Duplicate blocked: ${dedupKey}`);
     return;
   }
   alertSentAt.set(dedupKey, now);
@@ -122,6 +104,7 @@ async function sendTelegramNotification(message, dedupKey) {
     });
     const data = await res.json();
     if (!data.ok) console.error('[Telegram] API error:', data);
+    else          console.log(`[Telegram] Sent ✓ (${dedupKey})`);
   } catch (err) {
     console.error('[Telegram] Send failed:', err.message);
   }
@@ -130,33 +113,37 @@ async function sendTelegramNotification(message, dedupKey) {
 // ─── EMA helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Seed EMA from historical closed candles.
- * Uses SMA of the first `period` bars, then applies the recursive formula —
- * identical to TradingView's cold-start behaviour.
+ * Seed EMA from all closed historical candles (SMA cold-start, then recursive).
+ * Stores the result in emaState[symbol][period] — represents the EMA at the
+ * close of the LAST completed bar.
  */
-function initEMA(closedCandles, period) {
+function initEMA(symbol, closedCandles, period) {
   const data = closedCandles
     .filter(c => isFinite(c.close) && c.close > 0)
     .sort((a, b) => a.timestamp - b.timestamp);
 
-  if (data.length < period) return null;
+  if (data.length < period) {
+    emaState[symbol][period] = null;
+    return;
+  }
 
-  // SMA seed
+  // SMA seed over first `period` bars
   let ema = 0;
   for (let i = 0; i < period; i++) ema += data[i].close;
   ema /= period;
 
-  // Walk forward
+  // Walk forward through the rest
   const k = 2 / (period + 1);
   for (let i = period; i < data.length; i++) {
     ema = data[i].close * k + ema * (1 - k);
   }
-  return ema;
+
+  emaState[symbol][period] = ema;
 }
 
 /**
- * Advance the stored EMA by one closed bar.
- * One multiplication — no loop needed.
+ * Advance stored EMA when a bar closes.
+ * This keeps emaState always = EMA at the close of the last COMPLETED bar.
  */
 function advanceEMA(symbol, period, closedClose) {
   if (emaState[symbol][period] === null) return;
@@ -165,34 +152,35 @@ function advanceEMA(symbol, period, closedClose) {
 }
 
 /**
- * Return the "live" EMA for the current forming bar — exactly what TradingView
- * shows on the active bar (stored last-bar EMA stepped one tick forward).
+ * FIX Bug 1 — Return the stored EMA of the last CLOSED bar directly.
+ *
+ * The previous version applied the EMA formula to the live price on every tick:
+ *   return currentPrice * k + stored * (1 - k)
+ * That made the EMA chase the price aggressively, causing false crosses.
+ *
+ * Correct behaviour: the EMA value on the forming bar stays fixed at the last
+ * closed bar's EMA. It only advances when a bar actually closes.
+ * This matches TradingView's and most charting libraries' behaviour.
  */
-function getLiveEMA(symbol, period, currentPrice) {
-  const stored = emaState[symbol][period];
-  if (stored === null) return null;
-  const k = 2 / (period + 1);
-  return currentPrice * k + stored * (1 - k);
+function getEMA(symbol, period) {
+  return emaState[symbol][period];
 }
 
-// ─── EMA cross / touch detection ──────────────────────────────────────────────
+// ─── EMA cross detection ──────────────────────────────────────────────────────
 
-/**
- * On each tick, check whether price has crossed either EMA.
- * One alert per cross; 5-candle cooldown before re-alerting on the same EMA.
- */
 function checkEMATouches(symbol, timeframe, currentPrice, ema20, ema50) {
-  const symbolName   = displayNames[symbol];
-  const timeframeName = displayNames[timeframe];
+  const symbolName    = displayNames[symbol]    || symbol;
+  const timeframeName = displayNames[timeframe] || timeframe;
   const currentCount  = candleCount[symbol][timeframe];
 
   [20, 50].forEach(period => {
     const ema = period === 20 ? ema20 : ema50;
     if (ema === null) return;
 
-    const state = emaNotificationState[symbol][period];
+    // FIX Bug 2 & 3 — use per-timeframe state
+    const state = emaNotificationState[symbol][timeframe][period];
 
-    // Unlock after 5 closed candles
+    // Unlock cooldown after 5 closed candles
     if (state.notifSent && currentCount - state.lastNotifCandle >= 5) {
       state.notifSent = false;
     }
@@ -200,21 +188,21 @@ function checkEMATouches(symbol, timeframe, currentPrice, ema20, ema50) {
     if (state.notifSent) return;
 
     const currentSide  = currentPrice >= ema ? 'above' : 'below';
-    const previousSide = emaPriceSide[symbol][period];
+    const previousSide = emaPriceSide[symbol][timeframe][period];
 
-    emaPriceSide[symbol][period] = currentSide;
+    emaPriceSide[symbol][timeframe][period] = currentSide;
 
-    if (previousSide === null) return;   // first tick — no prior side
-    if (previousSide === currentSide) return; // no cross
+    if (previousSide === null) return;     // first tick — no prior side to compare
+    if (previousSide === currentSide) return; // no cross, nothing to do
 
-    // Cross detected — alert and lock
+    // Genuine cross detected
     const crossedUp = currentSide === 'above';
     const emoji     = crossedUp ? '📈' : '📉';
     const message   =
       `${emoji} *${period} EMA ${symbolName} on ${timeframeName}* : price Touch\n` +
-      ` EMA: ${ema.toFixed(4)} | Price: ${currentPrice.toFixed(4)}`;
+      `EMA: ${ema.toFixed(4)} | Price: ${currentPrice.toFixed(4)}`;
 
-    const dedupKey = `${symbol}:${period}`;
+    const dedupKey = `${symbol}:${timeframe}:${period}`;
     sendTelegramNotification(message, dedupKey);
     console.log(`[Alert] ${message.replace(/\*/g, '')}`);
 
@@ -229,10 +217,6 @@ function getCandleTimeframe(timestamp, granularity) {
   return Math.floor(timestamp / granularity) * granularity;
 }
 
-/**
- * Feed a live tick into the current forming candle.
- * When the candle closes, archive it and advance the EMA.
- */
 function updateCurrentCandle(symbol, price, timestamp) {
   Object.keys(timeframeMap).forEach(timeframe => {
     const granularity = timeframeMap[timeframe];
@@ -242,7 +226,7 @@ function updateCurrentCandle(symbol, price, timestamp) {
       !currentCandles[symbol][timeframe] ||
       currentCandles[symbol][timeframe].timestamp !== candleTime
     ) {
-      // Previous candle just closed
+      // Previous candle just closed — archive it and advance EMA
       if (currentCandles[symbol][timeframe]) {
         historicalData[symbol][timeframe].push(currentCandles[symbol][timeframe]);
 
@@ -254,9 +238,15 @@ function updateCurrentCandle(symbol, price, timestamp) {
         advanceEMA(symbol, 20, closedClose);
         advanceEMA(symbol, 50, closedClose);
         candleCount[symbol][timeframe]++;
+
+        console.log(
+          `\n[${symbol}/${timeframe}] Candle closed. ` +
+          `EMA20: ${emaState[symbol][20] !== null ? emaState[symbol][20].toFixed(4) : 'N/A'} | ` +
+          `EMA50: ${emaState[symbol][50] !== null ? emaState[symbol][50].toFixed(4) : 'N/A'}`
+        );
       }
 
-      // Open new candle
+      // Open new forming candle
       currentCandles[symbol][timeframe] = {
         timestamp: candleTime,
         open:  price,
@@ -265,11 +255,10 @@ function updateCurrentCandle(symbol, price, timestamp) {
         close: price
       };
     } else {
-      // Update forming candle
-      const candle  = currentCandles[symbol][timeframe];
-      candle.high   = Math.max(candle.high, price);
-      candle.low    = Math.min(candle.low,  price);
-      candle.close  = price;
+      const candle = currentCandles[symbol][timeframe];
+      candle.high  = Math.max(candle.high, price);
+      candle.low   = Math.min(candle.low,  price);
+      candle.close = price;
     }
   });
 }
@@ -282,21 +271,19 @@ function recalculateIndicators(symbol, timeframe, livePrice) {
 
   if (!historicalCandles || historicalCandles.length === 0 || !currentCandle) return;
 
-  const ema20 = getLiveEMA(symbol, 20, livePrice);
-  const ema50 = getLiveEMA(symbol, 50, livePrice);
+  // FIX Bug 1 — use stable closed-bar EMA, not a tick-by-tick live approximation
+  const ema20 = getEMA(symbol, 20);
+  const ema50 = getEMA(symbol, 50);
 
-  // Console output (replaces DOM table updates)
-  const trend20   = ema20 !== null ? (livePrice > ema20 ? 'Uptrend' : 'Downtrend') : 'N/A';
-  const trend50   = ema50 !== null ? (livePrice > ema50 ? 'Uptrend' : 'Downtrend') : 'N/A';
-  const dist20    = ema20 !== null ? (livePrice - ema20).toFixed(4) : 'N/A';
-  const dist50    = ema50 !== null ? (livePrice - ema50).toFixed(4) : 'N/A';
-  const ema20Str  = ema20 !== null ? ema20.toFixed(4) : 'N/A';
-  const ema50Str  = ema50 !== null ? ema50.toFixed(4) : 'N/A';
+  const trend20  = ema20 !== null ? (livePrice > ema20 ? 'Uptrend'   : 'Downtrend') : 'N/A';
+  const trend50  = ema50 !== null ? (livePrice > ema50 ? 'Uptrend'   : 'Downtrend') : 'N/A';
+  const dist20   = ema20 !== null ? (livePrice - ema20).toFixed(4) : 'N/A';
+  const dist50   = ema50 !== null ? (livePrice - ema50).toFixed(4) : 'N/A';
 
-  console.log(
-    `[${symbol}] Price: ${livePrice.toFixed(4)} | ` +
-    `20 EMA: ${ema20Str} (${trend20}, dist ${dist20}) | ` +
-    `50 EMA: ${ema50Str} (${trend50}, dist ${dist50})`
+  process.stdout.write(
+    `\r[${symbol}] Price: ${livePrice.toFixed(4)} | ` +
+    `EMA20: ${ema20 !== null ? ema20.toFixed(4) : 'N/A'} (${trend20} ${dist20}) | ` +
+    `EMA50: ${ema50 !== null ? ema50.toFixed(4) : 'N/A'} (${trend50} ${dist50})   `
   );
 
   checkEMATouches(symbol, timeframe, livePrice, ema20, ema50);
@@ -318,7 +305,7 @@ function processCandles(symbol, timeframe, candles) {
 
   if (data.length === 0) return;
 
-  // All bars except the last are closed; the last is still forming
+  // All bars except the last are treated as closed; the last is still forming
   historicalData[symbol][timeframe] = data.slice(0, -1);
 
   const lastCandle = data[data.length - 1];
@@ -331,17 +318,13 @@ function processCandles(symbol, timeframe, candles) {
   };
 
   // Seed EMA from all closed bars
-  emaState[symbol][20] = initEMA(historicalData[symbol][timeframe], 20);
-  emaState[symbol][50] = initEMA(historicalData[symbol][timeframe], 50);
-
-  const currentPrice = lastCandle.close;
-  const ema20 = getLiveEMA(symbol, 20, currentPrice);
-  const ema50 = getLiveEMA(symbol, 50, currentPrice);
+  initEMA(symbol, historicalData[symbol][timeframe], 20);
+  initEMA(symbol, historicalData[symbol][timeframe], 50);
 
   console.log(
     `[${symbol}/${timeframe}] Loaded ${data.length} candles. ` +
-    `Seed 20 EMA: ${ema20 !== null ? ema20.toFixed(4) : 'N/A'} | ` +
-    `Seed 50 EMA: ${ema50 !== null ? ema50.toFixed(4) : 'N/A'}`
+    `EMA20: ${emaState[symbol][20] !== null ? emaState[symbol][20].toFixed(4) : 'N/A'} | ` +
+    `EMA50: ${emaState[symbol][50] !== null ? emaState[symbol][50].toFixed(4) : 'N/A'}`
   );
 }
 
@@ -355,15 +338,11 @@ function sendMessage(message) {
 
 function requestCandles(symbol, timeframe) {
   const granularity = timeframeMap[timeframe];
-  const end   = Math.floor(Date.now() / 1000);
-  const start = end - MAX_HISTORICAL_CANDLES * granularity;
-
   sendMessage({
     ticks_history:     symbol,
     adjust_start_time: 1,
     count:             MAX_HISTORICAL_CANDLES,
     end:               'latest',
-    start,
     style:             'candles',
     granularity
   });
@@ -383,16 +362,14 @@ function handleMessage(raw) {
   }
 
   if (data.error) {
-    console.error('[WS] Server error:', data.error);
+    console.error('[WS] Server error:', data.error.message);
     return;
   }
 
   if (data.candles) {
     const symbol      = data.echo_req.ticks_history;
     const granularity = data.echo_req.granularity;
-    const timeframe   = Object.keys(timeframeMap).find(
-      key => timeframeMap[key] === granularity
-    );
+    const timeframe   = Object.keys(timeframeMap).find(k => timeframeMap[k] === granularity);
     if (timeframe) processCandles(symbol, timeframe, data.candles);
   }
 
@@ -406,8 +383,6 @@ function handleMessage(raw) {
     Object.keys(timeframeMap).forEach(timeframe => {
       recalculateIndicators(symbol, timeframe, price);
     });
-
-    process.stdout.write(`\r[${new Date().toLocaleTimeString()}] Last tick received`);
   }
 }
 
@@ -437,14 +412,8 @@ function initializeWebSocket() {
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
 
-function shutdown() {
-  console.log('\n[App] Shutting down…');
-  if (ws) ws.close();
-  process.exit(0);
-}
-
-process.on('SIGINT',  shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT',  () => { console.log('\n[App] Shutting down…'); ws && ws.close(); process.exit(0); });
+process.on('SIGTERM', () => { console.log('\n[App] Shutting down…'); ws && ws.close(); process.exit(0); });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
