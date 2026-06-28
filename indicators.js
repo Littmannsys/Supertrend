@@ -171,11 +171,15 @@ function checkEMATouches(symbol, timeframe, currentPrice) {
 
     const crossedUp = currentSide === 'above';
     const emoji     = crossedUp ? '📈' : '📉';
-    const message   =
-      `${emoji} *${period} EMA ${symbolName} on ${timeframeName}* : price Touch\n` +
+    const alertTime = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    // Telegram message
+    const message =
+      `${emoji} *${period} EMA ${symbolName}* [${alertTime}]\n` +
       `EMA: ${ema.toFixed(4)} | Price: ${currentPrice.toFixed(4)}`;
 
-    console.log(`[Alert] ${message.replace(/\*/g, '')}`);
+    // Console log matches Telegram format
+    console.log(`\n${emoji} ${period} EMA ${symbolName} [Alert ${alertTime}]\nEMA: ${ema.toFixed(4)} | Price: ${currentPrice.toFixed(4)}`);
     sendTelegramNotification(message, dedupKey);
   });
 }
