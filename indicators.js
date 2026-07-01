@@ -203,11 +203,12 @@ function updateCurrentCandle(symbol, price, timestamp) {
           historicalData[symbol][timeframe].shift();
 
         const closedClose = currentCandles[symbol][timeframe].close;
+        // Check cross BEFORE advancing EMA — price must be compared against
+        // the EMA that was active DURING the candle, not the next bar's EMA
+        checkEMATouches(symbol, timeframe, closedClose);
         advanceEMA(symbol, 20, closedClose);
         candleCount[symbol][timeframe]++;
         console.log(`\n[${symbol}/${timeframe}] Candle #${candleCount[symbol][timeframe]} closed @ ${closedClose}`);
-        // Check cross on candle CLOSE — most reliable signal, avoids mid-candle noise
-        checkEMATouches(symbol, timeframe, closedClose);
       }
 
       currentCandles[symbol][timeframe] = {
